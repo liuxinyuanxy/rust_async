@@ -1,5 +1,5 @@
+mod executor;
 mod signal;
-mod spawn;
 
 use async_std::task::spawn;
 
@@ -59,5 +59,6 @@ async fn demo2(tx: async_channel::Sender<()>) {
     let _ = tx.send(()).await;
 }
 fn main() {
-    spawn::block_on(demo());
+    let ex = executor::Executor::new(1);
+    ex.block_on(demo());
 }
