@@ -1,7 +1,8 @@
 use crate::signal::*;
+use async_channel::TryRecvError;
 use futures::future::BoxFuture;
 use scoped_tls::scoped_thread_local;
-scoped_thread_local!(static EX: Executor);
+scoped_thread_local!(pub(crate) static EX: Executor);
 
 use std::{
     cell::RefCell,
@@ -15,7 +16,7 @@ use std::{
 // scoped_thread_local!(static RUNNABLE: Mutex<VecDeque<Arc<Task>>>);
 
 struct ThreadPool {
-    handles: Vec<std::thread::JoinHandle<()>>,
+    handles: Option<Vec<std::thread::JoinHandle<()>>>, // according to https://stackoverflow.com/questions/63756181/cannot-move-out-of-handle-which-is-behind-a-shared-reference-move-occurs-beca
     sender: async_channel::Sender<Arc<Task>>,
 }
 
@@ -25,29 +26,30 @@ impl ThreadPool {
         let mut handles = Vec::with_capacity(size);
         for _ in 0..size {
             let recv: async_channel::Receiver<Arc<Task>> = receiver.clone();
-            handles.push(std::thread::spawn(move || {
-                while let Ok(task) = recv.try_recv() {
-                    let waker = Waker::from(task.clone());
-                    let mut cx = Context::from_waker(&waker);
-                    let _ = task.future.borrow_mut().as_mut().poll(&mut cx);
+            handles.push(std::thread::spawn(move || loop {
+                match recv.try_recv() {
+                    Ok(task) => {
+                        let waker = Waker::from(task.clone());
+                        let mut cx = Context::from_waker(&waker);
+                        let _ = task.future.borrow_mut().as_mut().poll(&mut cx);
+                    }
+                    Err(TryRecvError::Closed) => {
+                        break;
+                    }
+                    Err(TryRecvError::Empty) => {}
                 }
             }));
         }
-        ThreadPool { handles, sender }
+        ThreadPool {
+            handles: Some(handles),
+            sender,
+        }
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
-        self.handles.iter().for_each(|_| {
-            let _ = self.sender.try_send(Arc::new(Task {
-                future: RefCell::new(Box::pin(async {})),
-                signal: Arc::new(Signal::new()),
-            }));
-        });
-        self.handles.into_iter().for_each(|handle| {
-            handle.join().unwrap();
-        });
+        self.sender.close();
     }
 }
 
@@ -62,37 +64,25 @@ impl Executor {
         let runnable = Mutex::new(VecDeque::new());
         Executor { pool, runnable }
     }
-
-    fn spawn(&self, future: impl Future<Output = ()> + 'static + Send) {
-        let task = Arc::new(Task {
-            future: RefCell::new(Box::pin(future)),
-            signal: Arc::new(Signal::new()),
-        });
-        self.runnable.lock().unwrap().push_back(task.clone());
-    }
-
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
-        let mut fut = std::pin::pin!(future);
-        let waker = Waker::from(Arc::new(Task {
-            future: RefCell::new(Box::pin(async {})),
-            signal: Arc::new(Signal::new()),
-        }));
+        let signal = Arc::new(Signal::new());
+        let waker = Waker::from(signal.clone());
         let mut cx = Context::from_waker(&waker);
-        EX.set(self, || loop {
-            if let Poll::Ready(output) = fut.as_mut().poll(&mut cx) {
-                return output;
-            }
-            while let Some(task) = self.runnable.lock().unwrap().pop_front() {
-                self.pool.sender.try_send(task).unwrap();
+        EX.set(self, || {
+            let mut fut = std::pin::pin!(future);
+            loop {
+                if let Poll::Ready(output) = fut.as_mut().poll(&mut cx) {
+                    return output;
+                }
+                while let Some(task) = self.runnable.lock().unwrap().pop_front() {
+                    let _ = self.pool.sender.try_send(task);
+                }
+                signal.wait();
             }
         })
     }
 }
-impl Default for Executor {
-    fn default() -> Self {
-        Self::new(1)
-    }
-}
+
 struct Task {
     future: RefCell<BoxFuture<'static, ()>>,
     signal: Arc<Signal>,
@@ -108,4 +98,15 @@ impl Wake for Task {
         });
         self.signal.notify();
     }
+}
+
+pub fn spawn<F: Future<Output = ()> + 'static + Send>(future: F) {
+    let signal = Arc::new(Signal::new());
+    let task = Arc::new(Task {
+        future: RefCell::new(Box::pin(future)),
+        signal: signal.clone(),
+    });
+    EX.with(|ex| {
+        ex.runnable.lock().unwrap().push_back(task);
+    });
 }

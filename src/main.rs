@@ -1,7 +1,7 @@
 mod executor;
 mod signal;
 
-use async_std::task::spawn;
+use executor::spawn;
 
 // use std::{
 //     future::Future,
@@ -48,17 +48,21 @@ use async_std::task::spawn;
 // }
 
 async fn demo() {
-    let (tx, rx) = async_channel::bounded(1);
-    spawn(demo2(tx));
+    let (tx, rx) = async_channel::bounded::<i64>(12);
     println!("hello world");
-    let _ = rx.recv().await;
+    for i in 0..10 {
+        let tx = tx.clone();
+        spawn(async move {
+            println!("hello world {}", i);
+            tx.send(i).await.unwrap();
+        });
+    }
+    for _ in 0..10 {
+        println!("recv {}", rx.recv().await.unwrap());
+    }
 }
 
-async fn demo2(tx: async_channel::Sender<()>) {
-    println!("hello world2");
-    let _ = tx.send(()).await;
-}
 fn main() {
-    let ex = executor::Executor::new(1);
+    let ex = executor::Executor::new(13);
     ex.block_on(demo());
 }
