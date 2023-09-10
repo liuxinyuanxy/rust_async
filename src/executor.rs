@@ -50,6 +50,11 @@ impl ThreadPool {
 impl Drop for ThreadPool {
     fn drop(&mut self) {
         self.sender.close();
+        self.handles
+            .take()
+            .unwrap()
+            .into_iter()
+            .for_each(|h| h.join().unwrap());
     }
 }
 

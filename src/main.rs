@@ -55,6 +55,11 @@ async fn demo() {
         spawn(async move {
             println!("hello world {}", i);
             tx.send(i).await.unwrap();
+            // sleep some time
+            for _ in 0..100000000 {
+                let _ = 1 + 1;
+            }
+            println!("finish {}, i'm not killed", i);
         });
     }
     for _ in 0..10 {
@@ -63,6 +68,6 @@ async fn demo() {
 }
 
 fn main() {
-    let ex = executor::Executor::new(13);
+    let ex = executor::Executor::new(4);
     ex.block_on(demo());
 }
